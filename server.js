@@ -261,7 +261,7 @@ app.get(
       process.env.JWT_SECRET,
       { expiresIn: "7d" }
     );
-   res.redirect(`/editor.html?token=${token}`);
+    res.redirect(`/?token=${token}`);
   }
 );
 
