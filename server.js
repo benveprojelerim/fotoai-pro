@@ -12,7 +12,7 @@ const cheerio = require("cheerio");
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const session = require("express-session");
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 const crypto = require("crypto");
 
 const User = require("./models/User");
@@ -84,46 +84,24 @@ const ChatMessageSchema = new mongoose.Schema({
 const ChatMessage = mongoose.model("ChatMessage", ChatMessageSchema);
 
 /* =====================
-   NODEMAILER TRANSPORTER
-   .env dosyasına şunları ekleyin:
-     MAIL_HOST=smtp.gmail.com
-     MAIL_PORT=587
-     MAIL_USER=siz@gmail.com
-     MAIL_PASS=xxxxxxxxxxxxxxxx   ← Gmail App Password (16 hane, boşluksuz)
-     MAIL_FROM="fotoAI PRO <siz@gmail.com>"
+   RESEND (E-POSTA GÖNDERİMİ)
+   .env dosyasına şunu ekleyin:
+     RESEND_API_KEY=re_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+     MAIL_FROM="fotoAI PRO <onboarding@resend.dev>"
 
-   Gmail App Password almak için:
-     myaccount.google.com → Güvenlik → 2 Adımlı Doğrulama (aktif olmalı)
-     → Uygulama şifreleri → Posta → 16 haneli şifreyi kopyala
+   Not: Kendi domaininizi Resend'e doğrulatmadan önce
+   sadece "onboarding@resend.dev" gönderen adresi çalışır.
+   Kendi domaininizi doğrulattıktan sonra MAIL_FROM'u
+   "fotoAI PRO <bildirim@sizin-domaininiz.com>" olarak değiştirebilirsiniz.
 ===================== */
-const transporter = nodemailer.createTransport({
-  host:   process.env.MAIL_HOST || "smtp.gmail.com",
-  port:   parseInt(process.env.MAIL_PORT || "587"),
-  secure: process.env.MAIL_PORT === "465",   // 465 → TLS, 587 → STARTTLS
-  auth: {
-    user: process.env.MAIL_USER,
-    pass: process.env.MAIL_PASS,
-  },
-});
-
-// Sunucu başladığında mail bağlantısını test et
-transporter.verify((error) => {
-  if (error) {
-    console.error("❌ Mail bağlantı hatası:", error.message);
-    console.error("   → MAIL_USER:", process.env.MAIL_USER || "(tanımsız)");
-    console.error("   → MAIL_HOST:", process.env.MAIL_HOST || "smtp.gmail.com");
-    console.error("   → MAIL_PORT:", process.env.MAIL_PORT || "587");
-    console.error("   → MAIL_PASS:", process.env.MAIL_PASS ? "***tanımlı***" : "(tanımsız)");
-  } else {
-    console.log("✅ Mail sunucusu hazır →", process.env.MAIL_USER);
-  }
-});
+const resend = new Resend(process.env.RESEND_API_KEY);
+const MAIL_FROM = process.env.MAIL_FROM || "fotoAI PRO <onboarding@resend.dev>";
 
 async function sendOtpEmail(email, code) {
   try {
-    const info = await transporter.sendMail({
-      from:    process.env.MAIL_FROM || process.env.MAIL_USER,
-      to:      email,
+    const { data, error } = await resend.emails.send({
+      from: MAIL_FROM,
+      to: email,
       subject: "fotoAI PRO – E-posta Doğrulama Kodu",
       html: `
         <div style="font-family:'Segoe UI',sans-serif;background:#0e0e14;color:#e8e8f0;padding:40px;border-radius:12px;max-width:480px;margin:auto">
@@ -140,7 +118,10 @@ async function sendOtpEmail(email, code) {
         </div>
       `,
     });
-    console.log("✅ OTP maili gönderildi →", email, "| messageId:", info.messageId);
+
+    if (error) throw new Error(error.message || JSON.stringify(error));
+
+    console.log("✅ OTP maili gönderildi →", email, "| id:", data?.id);
   } catch (err) {
     console.error("❌ OTP mail gönderilemedi →", email);
     console.error("   Hata:", err.message);
@@ -151,8 +132,8 @@ async function sendOtpEmail(email, code) {
 
 async function sendResetOtpEmail(email, code) {
   try {
-    const info = await transporter.sendMail({
-      from: process.env.MAIL_FROM || process.env.MAIL_USER,
+    const { data, error } = await resend.emails.send({
+      from: MAIL_FROM,
       to: email,
       subject: "fotoAI PRO – Şifre Sıfırlama Kodu",
       html: `
@@ -170,7 +151,10 @@ async function sendResetOtpEmail(email, code) {
         </div>
       `,
     });
-    console.log("✅ Reset OTP maili gönderildi →", email, "| messageId:", info.messageId);
+
+    if (error) throw new Error(error.message || JSON.stringify(error));
+
+    console.log("✅ Reset OTP maili gönderildi →", email, "| id:", data?.id);
   } catch (err) {
     console.error("❌ Reset OTP mail gönderilemedi →", email, err.message);
     throw new Error("E-posta gönderilemedi: " + err.message);
@@ -360,7 +344,7 @@ app.post("/verify-otp", async (req, res) => {
 });
 
 /* =====================
-   RESEND OTP
+   RESEND OTP (kod tekrar gönderme, e-posta yeniden gönderim rotası)
 ===================== */
 app.post("/resend-otp", async (req, res) => {
   try {

@@ -14,7 +14,8 @@
     "mongoose": "^9.7.0",
     "nodemailer": "^9.0.1",
     "passport": "^0.7.0",
-    "passport-google-oauth20": "^2.0.0"
+    "passport-google-oauth20": "^2.0.0",
+    "resend": "^6.17.2"
   },
   "name": "smart-app-backend",
   "version": "1.0.0",
