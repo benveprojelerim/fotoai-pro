@@ -12,7 +12,7 @@ const cheerio = require("cheerio");
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const session = require("express-session");
-const { Resend } = require("resend");
+const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 
 const User = require("./models/User");
@@ -84,22 +84,40 @@ const ChatMessageSchema = new mongoose.Schema({
 const ChatMessage = mongoose.model("ChatMessage", ChatMessageSchema);
 
 /* =====================
-   RESEND (E-POSTA GÖNDERİMİ)
-   .env dosyasına şunu ekleyin:
-     RESEND_API_KEY=re_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-     MAIL_FROM="fotoAI PRO <onboarding@resend.dev>"
+   GMAIL SMTP (NODEMAILER) — E-POSTA GÖNDERİMİ
+   .env dosyasına şunları ekleyin:
+     GMAIL_USER=sizin-adresiniz@gmail.com
+     GMAIL_APP_PASSWORD=abcdefghijklmnop   (boşluksuz, 16 haneli Uygulama Şifresi)
 
-   Not: Kendi domaininizi Resend'e doğrulatmadan önce
-   sadece "onboarding@resend.dev" gönderen adresi çalışır.
-   Kendi domaininizi doğrulattıktan sonra MAIL_FROM'u
-   "fotoAI PRO <bildirim@sizin-domaininiz.com>" olarak değiştirebilirsiniz.
+   Not: Bu şifreyi normal Gmail şifreniz değil, Google hesabınızda
+   2 Adımlı Doğrulamayı açtıktan sonra
+   myaccount.google.com/apppasswords adresinden oluşturduğunuz
+   "Uygulama Şifresi" olmalı.
 ===================== */
-const resend = new Resend(process.env.RESEND_API_KEY);
-const MAIL_FROM = process.env.MAIL_FROM || "fotoAI PRO <onboarding@resend.dev>";
+const GMAIL_USER = process.env.GMAIL_USER;
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
+const MAIL_FROM = process.env.MAIL_FROM || `fotoAI PRO <${GMAIL_USER}>`;
+
+const mailTransporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: GMAIL_USER,
+    pass: GMAIL_APP_PASSWORD,
+  },
+});
+
+// Sunucu açılırken SMTP bağlantısını doğrula (yanlış şifre/ayar varsa erken fark edilsin)
+mailTransporter.verify((err) => {
+  if (err) {
+    console.error("❌ Gmail SMTP bağlantı hatası:", err.message);
+  } else {
+    console.log("✅ Gmail SMTP hazır");
+  }
+});
 
 async function sendOtpEmail(email, code) {
   try {
-    const { data, error } = await resend.emails.send({
+    const info = await mailTransporter.sendMail({
       from: MAIL_FROM,
       to: email,
       subject: "fotoAI PRO – E-posta Doğrulama Kodu",
@@ -119,9 +137,7 @@ async function sendOtpEmail(email, code) {
       `,
     });
 
-    if (error) throw new Error(error.message || JSON.stringify(error));
-
-    console.log("✅ OTP maili gönderildi →", email, "| id:", data?.id);
+    console.log("✅ OTP maili gönderildi →", email, "| id:", info.messageId);
   } catch (err) {
     console.error("❌ OTP mail gönderilemedi →", email);
     console.error("   Hata:", err.message);
@@ -132,7 +148,7 @@ async function sendOtpEmail(email, code) {
 
 async function sendResetOtpEmail(email, code) {
   try {
-    const { data, error } = await resend.emails.send({
+    const info = await mailTransporter.sendMail({
       from: MAIL_FROM,
       to: email,
       subject: "fotoAI PRO – Şifre Sıfırlama Kodu",
@@ -152,9 +168,7 @@ async function sendResetOtpEmail(email, code) {
       `,
     });
 
-    if (error) throw new Error(error.message || JSON.stringify(error));
-
-    console.log("✅ Reset OTP maili gönderildi →", email, "| id:", data?.id);
+    console.log("✅ Reset OTP maili gönderildi →", email, "| id:", info.messageId);
   } catch (err) {
     console.error("❌ Reset OTP mail gönderilemedi →", email, err.message);
     throw new Error("E-posta gönderilemedi: " + err.message);
@@ -245,7 +259,7 @@ app.get(
       process.env.JWT_SECRET,
       { expiresIn: "7d" }
     );
-    
+
     res.redirect(`/editor.html?token=${token}`);
   }
 );
