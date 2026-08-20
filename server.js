@@ -14,6 +14,8 @@ const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const session = require("express-session");
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
+const { OAuth2Client } = require("google-auth-library");
+const multer = require("multer");
 
 const User = require("./models/User");
 
@@ -34,6 +36,18 @@ app.use(
 
 app.use(passport.initialize());
 app.use(passport.session());
+
+// Android'in Google Sign-In SDK'sından aldığı ID token'ı doğrulamak için.
+// AYNI GOOGLE_CLIENT_ID kullanılıyor (passport-google-oauth20 için zaten
+// tanımlı olan Web Client ID) — Android tarafında da bu ID "Web Client ID"
+// olarak GoogleSignInOptions.requestIdToken()'a verilmeli.
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+// Fotoğraf upload için (Android — fotoğraf yükleme akışı)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+});
 
 /* =====================
    MONGODB
@@ -82,6 +96,19 @@ const ChatMessageSchema = new mongoose.Schema({
   createdAt:      { type: Date, default: Date.now },
 });
 const ChatMessage = mongoose.model("ChatMessage", ChatMessageSchema);
+
+/* =====================
+   PHOTO MODEL (Android — fotoğraf upload/edit akışı için)
+   Render'ın disk alanı kalıcı olmadığı için (free tier'da her deploy'da
+   sıfırlanır) fotoğrafları MongoDB içinde Buffer olarak saklıyoruz.
+===================== */
+const PhotoSchema = new mongoose.Schema({
+  userId:    { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  data:      { type: Buffer, required: true },
+  mimeType:  { type: String, required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+const Photo = mongoose.model("Photo", PhotoSchema);
 
 /* =====================
    GMAIL SMTP (NODEMAILER) — E-POSTA GÖNDERİMİ
@@ -263,6 +290,56 @@ app.get(
     res.redirect(`/editor.html?token=${token}`);
   }
 );
+
+/* =====================
+   GOOGLE SIGN-IN (Android — ID Token doğrulama)
+   Web akışındaki /auth/google/callback'ten FARKLI: burada Android,
+   Google Sign-In SDK'sından aldığı idToken'ı doğrudan bize gönderiyor,
+   biz Google'a karşı doğrulayıp kendi JWT'mizi dönüyoruz.
+===================== */
+app.post("/auth/google/verify-token", async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ message: "idToken gerekli" });
+
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      payload = ticket.getPayload();
+    } catch (verifyErr) {
+      console.error("GOOGLE TOKEN VERIFY ERROR:", verifyErr.message);
+      return res.status(401).json({ success: false, message: "Google token doğrulanamadı" });
+    }
+
+    if (!payload || !payload.email) {
+      return res.status(401).json({ success: false, message: "Google hesap bilgisi alınamadı" });
+    }
+
+    let user = await User.findOne({ email: payload.email });
+    if (!user) {
+      user = await User.create({
+        firstName: payload.given_name || "Google",
+        lastName: payload.family_name || "Kullanıcı",
+        email: payload.email,
+        password: "google-auth", // normal login akışıyla çakışmasın diye placeholder
+      });
+    }
+
+    const token = jwt.sign(
+      { id: user._id, email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: "24d" }
+    );
+
+    res.json({ success: true, token, user });
+  } catch (err) {
+    console.error("GOOGLE VERIFY TOKEN ERROR:", err.message);
+    res.status(500).json({ success: false, message: "Google girişi başarısız oldu", error: err.message });
+  }
+});
 
 /* =====================
    REGISTER  (Adım 1 – OTP gönder)
@@ -524,7 +601,7 @@ app.get("/profile", auth, async (req, res) => {
   res.json({ success: true, user });
 });
 
-/* PROFILE UPDATE — Ad/Soyad/E-posta/Biyografi kalıcı kaydetme (YENİ) */
+/* PROFILE UPDATE — Ad/Soyad/E-posta/Biyografi kalıcı kaydetme */
 app.put("/profile", auth, async (req, res) => {
   try {
     const { firstName, lastName, email, bio } = req.body;
@@ -576,6 +653,137 @@ app.delete("/projects/:id", auth, async (req, res) => {
   await Project.findOneAndDelete({ _id: req.params.id, userId: req.user.id });
   res.json({ success: true, message: "Silindi" });
 });
+
+/* =====================
+   PHOTO UPLOAD (Android — fotoğraf yükleme)
+===================== */
+app.post("/upload-photo", auth, (req, res, next) => {
+  upload.single("photo")(req, res, (err) => {
+    if (err) {
+      if (err.code === "LIMIT_FILE_SIZE") {
+        return res.status(413).json({ success: false, message: "Dosya boyutu çok büyük (maksimum 8MB)." });
+      }
+      return res.status(400).json({ success: false, message: "Dosya yüklenemedi: " + err.message });
+    }
+    next();
+  });
+}, async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: "Geçerli bir görsel dosyası gönderin." });
+    }
+
+    const allowedMimes = ["image/jpeg", "image/png", "image/webp"];
+    if (!allowedMimes.includes(req.file.mimetype)) {
+      return res.status(400).json({ success: false, message: "Sadece JPG, PNG veya WEBP kabul edilir." });
+    }
+
+    const photo = await Photo.create({
+      userId: req.user.id,
+      data: req.file.buffer,
+      mimeType: req.file.mimetype,
+    });
+
+    res.json({
+      success: true,
+      photoId: photo._id,
+      photoUrl: `${req.protocol}://${req.get("host")}/photos/${photo._id}/raw`,
+    });
+  } catch (err) {
+    console.error("UPLOAD PHOTO ERROR:", err.message);
+    res.status(500).json({ success: false, message: "Fotoğraf yüklenemedi", error: err.message });
+  }
+});
+
+/* Yüklenen fotoğrafın ham halini döner (yukarıdaki photoUrl bu adrese işaret ediyor) */
+app.get("/photos/:id/raw", auth, async (req, res) => {
+  try {
+    const photo = await Photo.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!photo) return res.status(404).json({ message: "Fotoğraf bulunamadı" });
+    res.set("Content-Type", photo.mimeType);
+    res.send(photo.data);
+  } catch (err) {
+    res.status(500).json({ message: "Fotoğraf getirilemedi" });
+  }
+});
+
+/* =====================
+   AI PHOTO EDIT (Android — yüklenen fotoğrafı düzenleme)
+===================== */
+app.post("/edit-photo", auth, async (req, res) => {
+  try {
+    const { photoId, operation, options } = req.body;
+    if (!photoId || !operation) {
+      return res.status(400).json({ success: false, message: "photoId ve operation gerekli" });
+    }
+
+    const photo = await Photo.findOne({ _id: photoId, userId: req.user.id });
+    if (!photo) return res.status(404).json({ success: false, message: "Fotoğraf bulunamadı" });
+
+    let resultBuffer;
+
+    if (operation === "background_remove") {
+      resultBuffer = await removeBackgroundHF(photo.data, photo.mimeType);
+    } else if (["enhance", "background_replace", "style_edit"].includes(operation)) {
+      const prompt = buildEditPrompt(operation, options);
+      resultBuffer = await imageToImageHF(photo.data, photo.mimeType, prompt);
+    } else {
+      return res.status(400).json({ success: false, message: "Bilinmeyen işlem türü: " + operation });
+    }
+
+    const base64 = resultBuffer.toString("base64");
+    res.json({ success: true, resultImage: `data:image/png;base64,${base64}` });
+  } catch (err) {
+    console.error("EDIT PHOTO ERROR:", err.message);
+    res.status(500).json({ success: false, message: "AI işlemi başarısız oldu", error: err.message });
+  }
+});
+
+function buildEditPrompt(operation, options) {
+  switch (operation) {
+    case "enhance":
+      return "enhance photo quality, sharpen details, improve lighting, professional photo retouching";
+    case "background_replace":
+      return (options && options.newBackgroundPrompt) || "replace background with a clean professional studio background";
+    case "style_edit":
+      return (options && options.prompt) || "apply a subtle artistic photo edit, keep the subject recognizable";
+    default:
+      return "improve this photo";
+  }
+}
+
+// Arka plan kaldırma - HF Inference API (görsel segmentasyon/matting modeli)
+async function removeBackgroundHF(imageBuffer, mimeType) {
+  const response = await axios.post(
+    "https://api-inference.huggingface.co/models/briaai/RMBG-1.4",
+    imageBuffer,
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.HF_TOKEN}`,
+        "Content-Type": mimeType,
+      },
+      responseType: "arraybuffer",
+      timeout: 60000,
+    }
+  );
+  return Buffer.from(response.data);
+}
+
+// Fotoğraf iyileştirme / arka plan değiştirme / stil düzenleme - image-to-image
+async function imageToImageHF(imageBuffer, mimeType, prompt) {
+  const client = new InferenceClient(process.env.HF_TOKEN);
+  const blob = new Blob([imageBuffer], { type: mimeType });
+
+  const output = await client.imageToImage({
+    provider: "replicate",
+    model: "black-forest-labs/FLUX.1-dev", // TODO: img2img'i iyi destekleyen bir modelle test edin
+    inputs: blob,
+    parameters: { prompt },
+  });
+
+  const arrayBuffer = await output.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
 
 /* =====================
    CHAT HISTORY
